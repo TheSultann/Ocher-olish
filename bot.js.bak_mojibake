@@ -1,0 +1,746 @@
+﻿require('dotenv').config();
+const { Telegraf, Markup } = require('telegraf');
+const dbActions = require('./db');
+
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || 'DUMMY_TOKEN_PLEASE_REPLACE');
+const STAFF_IDS = (process.env.STAFF_IDS || '')
+    .split(',')
+    .map(id => parseInt(id.trim()))
+    .filter(id => !isNaN(id));
+
+// ================================================================
+//  REPLY KEYBOARD MENULARI
+// ================================================================
+
+const CLIENT_MENU = Markup.keyboard([
+    ['рџЋ« Navbat olish', 'рџ“‹ Mening chiptam'],
+    ['в„№пёЏ Ma\'lumot', 'рџ“ћ Aloqa']
+]).resize();
+
+const STAFF_MENU = Markup.keyboard([
+    ['рџ“Љ Boshqaruv paneli', 'рџ“‹ Navbat ro\'yxati'],
+    ['вњ… Keyingisini chaqirish', 'рџ”„ Yangilash']
+]).resize();
+
+// ================================================================
+//  MIDDLEWARE
+// ================================================================
+
+bot.use(async (ctx, next) => {
+    if (ctx.from) {
+        const isStaff = STAFF_IDS.includes(ctx.from.id);
+        dbActions.upsertUser(
+            ctx.from.id,
+            ctx.from.username,
+            ctx.from.first_name,
+            isStaff ? 'staff' : 'client'
+        );
+        ctx.state.isStaff = isStaff;
+    }
+    return next();
+});
+
+// ================================================================
+//  /start
+// ================================================================
+
+bot.start(async (ctx) => {
+    const name = ctx.from.first_name || 'Foydalanuvchi';
+
+    if (ctx.state.isStaff) {
+        await ctx.reply(
+            `рџ‘‹ Xush kelibsiz, <b>${name}</b>!\n\n` +
+            `рџЏ¦ <b>Bank Navbat Tizimi</b> вЂ” Xodim paneli\n\n` +
+            `Quyidagi tugmalardan birini tanlang:`,
+            { parse_mode: 'HTML', ...STAFF_MENU }
+        );
+    } else {
+        await ctx.reply(
+            `рџ‘‹ Assalomu alaykum, <b>${name}</b>!\n\n` +
+            `рџЏ¦ <b>Bank Navbat Tizimi</b>ga xush kelibsiz!\n\n` +
+            `Bu bot orqali siz:\n` +
+            `вЂў рџЋ« Onlayn navbat olishingiz\n` +
+            `вЂў рџ“‹ Chiptangiz holatini kuzatishingiz\n` +
+            `вЂў рџ”” Navbatingiz kelganda bildirishnoma olishingiz mumkin!\n\n` +
+            `Boshlash uchun quyidagi tugmani bosing рџ‘‡`,
+            { parse_mode: 'HTML', ...CLIENT_MENU }
+        );
+    }
+});
+
+// ================================================================
+//  MIJOZ вЂ” NAVBAT OLISH (Reply button)
+// ================================================================
+
+bot.hears('рџЋ« Navbat olish', async (ctx) => {
+    if (ctx.state.isStaff) return;
+
+    const branches = dbActions.getBranches();
+    if (branches.length === 0) {
+        return ctx.reply(
+            'вљ пёЏ Hozircha faol filiallar mavjud emas.\nKeyinroq qayta urinib ko\'ring.',
+            CLIENT_MENU
+        );
+    }
+
+    // Har bir filial вЂ” alohida qatorda
+    const rows = branches.map(b => [
+        Markup.button.callback(`рџЏў ${b.name}`, `br_${b.id}`)
+    ]);
+    rows.push([Markup.button.callback('вќЊ Bekor qilish', 'act_cancel')]);
+
+    await ctx.reply(
+        'рџЏў <b>Filial tanlang</b>\n\nQaysi filialga borishni xohlaysiz?',
+        { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }
+    );
+});
+
+// ================================================================
+//  FILIAL TANLASH (inline callback)
+// ================================================================
+
+bot.action(/^br_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+
+    const branchId = parseInt(ctx.match[1]);
+    const branch = dbActions.getBranchById(branchId);
+    const services = dbActions.getServices(branchId);
+
+    if (!services || services.length === 0) {
+        return ctx.editMessageText(
+            `вљ пёЏ Bu filialda hozircha xizmatlar mavjud emas.`,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('рџ”™ Filiallarga qaytish', 'act_branches')]
+            ])
+        );
+    }
+
+    const rows = services.map(s => {
+        const qLen = dbActions.getQueueLength(s.id);
+        const dot = qLen === 0 ? 'рџџў' : qLen < 5 ? 'рџџЎ' : 'рџ”ґ';
+        return [
+            Markup.button.callback(
+                `${dot} ${s.name}  вЂ”  рџ‘Ґ ${qLen} kishi`,
+                `svc_${s.id}`
+            )
+        ];
+    });
+    rows.push([Markup.button.callback('рџ”™ Boshqa filial', 'act_branches')]);
+
+    const brName = branch ? branch.name : 'Filial';
+    await ctx.editMessageText(
+        `рџЏў <b>${brName}</b>\n\n` +
+        `рџ“‹ Xizmat turini tanlang:\n` +
+        `рџџў bo'sh  рџџЎ o'rtacha  рџ”ґ gavjum`,
+        { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }
+    );
+});
+
+// ================================================================
+//  XIZMAT TANLASH вЂ” CHIPTA YARATISH
+// ================================================================
+
+bot.action(/^svc_(\d+)$/, async (ctx) => {
+    const serviceId = parseInt(ctx.match[1]);
+
+    try {
+        const ticket = dbActions.createTicket(ctx.from.id, serviceId);
+        const peopleAhead = dbActions.getVirtualPeopleAhead(ticket.id, serviceId);
+        const waitTime = dbActions.getWaitEstimate(ticket.id, serviceId);
+
+        await ctx.answerCbQuery('вњ… Navbatga yozildingiz!');
+
+        const msg =
+            `вњ… <b>Navbatga muvaffaqiyatli yozildingiz!</b>\n\n` +
+            `в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n` +
+            `рџЋ« <b>Chipta raqami:</b>  <code>${ticket.ticket_number}</code>\n` +
+            `рџ‘Ґ <b>Siz oldida:</b>  ${peopleAhead} kishi\n` +
+            `вЏі <b>Taxminiy kutish:</b>  ~${waitTime} daqiqa\n` +
+            `в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n\n` +
+            `рџ”” Navbatingiz kelganda <b>avtomatik xabar</b> yuboriladi.\n` +
+            `Bankka o'z vaqtida keling! рџЏ¦`;
+
+        await ctx.editMessageText(msg, {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('рџ“‹ Chiptamni ko\'rish', 'act_myticket')],
+                [Markup.button.callback('вќЊ Chiptani bekor qilish', `cxl_${ticket.id}`)]
+            ])
+        });
+
+    } catch (err) {
+        if (err.message === 'Siz allaqachon navbatdasiz') {
+            await ctx.answerCbQuery('в„№пёЏ Sizda allaqachon faol chipta bor!', { show_alert: true });
+            await sendMyTicket(ctx, true);
+        } else {
+            console.error('createTicket error:', err.message);
+            await ctx.answerCbQuery('вќЊ Xatolik yuz berdi, qayta urinib ko\'ring.', { show_alert: true });
+        }
+    }
+});
+
+// ================================================================
+//  MENING CHIPTAM
+// ================================================================
+
+bot.hears('рџ“‹ Mening chiptam', async (ctx) => {
+    if (ctx.state.isStaff) return;
+    await sendMyTicket(ctx, false);
+});
+
+bot.action('act_myticket', async (ctx) => {
+    await ctx.answerCbQuery('рџ”„ Yangilandi!');
+    await simulateFakeQueue();
+    await sendMyTicket(ctx, true, true);
+});
+
+async function sendMyTicket(ctx, isEdit, isRefresh = false) {
+    const ticket = dbActions.getActiveTicket(ctx.from.id);
+
+    if (!ticket) {
+        const text =
+            `вќЊ <b>Faol chiptangiz yo'q</b>\n\n` +
+            `Navbat olish uchun В«рџЋ« Navbat olishВ» tugmasini bosing.`;
+        const opts = {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('рџЋ« Navbat olish', 'act_branches')]
+            ])
+        };
+        if (isEdit) return ctx.editMessageText(text, opts).catch(() => ctx.reply(text, opts));
+        return ctx.reply(text, opts);
+    }
+
+    if (isRefresh && ticket.status === 'waiting') {
+        dbActions.decrementWaitOnRefresh(ticket.id);
+    }
+
+    const waitTime = dbActions.getWaitEstimate(ticket.id, ticket.service_id);
+    const peopleAhead = dbActions.getVirtualPeopleAhead(ticket.id, ticket.service_id);
+
+    // --- Vizualizatsiya ---
+
+    // Holat
+    let statusLine;
+    if (ticket.status === 'called') {
+        statusLine = `рџ”” <b>SIZNI CHAQIRISHMOQDA!</b>`;
+    } else if (peopleAhead === 0) {
+        statusLine = `вњ… <b>Navbat boshidasiz!</b>`;
+    } else {
+        statusLine = `вЏі Kutilmoqda`;
+    }
+
+    // Toza Unicode progress bar
+    function buildProgressBar(ahead, total) {
+        const MAX = 10;
+        const safeTotal = Math.max(total, ahead + 1);
+        const filled = Math.min(Math.round((ahead / safeTotal) * MAX), MAX);
+        const bar = 'в–€'.repeat(filled) + 'в–‘'.repeat(MAX - filled);
+        return `<code>[${bar}]</code>  ${ahead}/${safeTotal}`;
+    }
+
+    let msg =
+        `рџЋ« <b>Sizning chiptangiz</b>\n\n` +
+        `в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n` +
+        `рџЏў <b>Filial:</b>  ${ticket.branch_name}\n` +
+        `рџ“‹ <b>Xizmat:</b>  ${ticket.service_name}\n` +
+        `рџ”ў <b>Chipta:</b>  <code>${ticket.ticket_number}</code>\n` +
+        `рџ“Љ <b>Holat:</b>  ${statusLine}\n` +
+        `в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n`;
+
+    if (ticket.status === 'called') {
+        msg += `\nвљ пёЏ Iltimos, xizmat oynasiga <b>darhol yaqinlashing!</b>\n`;
+    } else if (peopleAhead === 0) {
+        msg += `\nрџЋ‰ <b>Siz birinchisiz!</b> Tez orada chaqirilasiz.\n`;
+        msg += `вЏі <b>Taxminiy kutish:</b>  ~${waitTime} daqiqa\n`;
+        msg += `${buildProgressBar(0, 1)}\n`;
+    } else {
+        const totalInQueue = dbActions.getQueueLength(ticket.service_id);
+        msg += `\nрџ‘Ґ <b>Siz oldida:</b>  ${peopleAhead} kishi\n`;
+        msg += `вЏі <b>Taxminiy kutish:</b>  ~${waitTime} daqiqa\n`;
+        msg += `\n${buildProgressBar(peopleAhead, totalInQueue)}\n`;
+    }
+
+    const opts = {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback('рџ”„ Yangilash', 'act_myticket')],
+            [Markup.button.callback('вќЊ Chiptani bekor qilish', `cxl_${ticket.id}`)]
+        ])
+    };
+
+    if (isEdit) {
+        return ctx.editMessageText(msg, opts).catch(err => {
+            // "message is not modified" xatosini e'tiborsiz qoldiramiz
+            if (!err.description || !err.description.includes('not modified')) {
+                return ctx.reply(msg, opts);
+            }
+        });
+    }
+    return ctx.reply(msg, opts);
+}
+
+
+
+// ================================================================
+//  CHIPTANI BEKOR QILISH
+// ================================================================
+
+bot.action(/^cxl_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const ticketId = parseInt(ctx.match[1]);
+    const success = dbActions.cancelTicket(ticketId, ctx.from.id);
+
+    if (success) {
+        await ctx.editMessageText(
+            `вњ… <b>Chiptangiz bekor qilindi.</b>\n\n` +
+            `Qayta navbat olish uchun В«рџЋ« Navbat olishВ» tugmasini bosing.`,
+            {
+                parse_mode: 'HTML',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('рџЋ« Qayta navbat olish', 'act_branches')]
+                ])
+            }
+        );
+    } else {
+        await ctx.answerCbQuery(
+            'вљ пёЏ Chiptani bekor qilib bo\'lmadi. U allaqachon yopilgan yoki chaqirilgan.',
+            { show_alert: true }
+        );
+    }
+});
+
+// ================================================================
+//  BRANCHES BACK BUTTON
+// ================================================================
+
+bot.action('act_branches', async (ctx) => {
+    await ctx.answerCbQuery();
+    const branches = dbActions.getBranches();
+
+    if (branches.length === 0) {
+        return ctx.editMessageText('вљ пёЏ Hozircha mavjud filiallar yo\'q.');
+    }
+
+    const rows = branches.map(b => [
+        Markup.button.callback(`рџЏў ${b.name}`, `br_${b.id}`)
+    ]);
+    rows.push([Markup.button.callback('вќЊ Bekor qilish', 'act_cancel')]);
+
+    await ctx.editMessageText(
+        'рџЏў <b>Filial tanlang</b>\n\nQaysi filialga borishni xohlaysiz?',
+        { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }
+    );
+});
+
+bot.action('act_cancel', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.deleteMessage().catch(() => { });
+});
+
+// ================================================================
+//  MA'LUMOT va ALOQA
+// ================================================================
+
+bot.hears('в„№пёЏ Ma\'lumot', async (ctx) => {
+    await ctx.reply(
+        'рџЏ¦ <b>Bank Navbat Tizimi haqida</b>\n\n' +
+        'рџ“Њ Bu tizim orqali siz bankka kelmasdan oldin onlayn navbat olishingiz mumkin.\n\n' +
+        '<b>Qanday ishlaydi?</b>\n' +
+        '1пёЏвѓЈ В«рџЋ« Navbat olishВ» tugmasini bosing\n' +
+        '2пёЏвѓЈ Filialni tanlang\n' +
+        '3пёЏвѓЈ Xizmat turini tanlang\n' +
+        '4пёЏвѓЈ Navbatingiz kelganda sizga xabar yuboriladi!\n\n' +
+        'вЏ° <b>Ish vaqti:</b> 09:00 вЂ” 18:00 (Du-Ju)',
+        { parse_mode: 'HTML' }
+    );
+});
+
+bot.hears('рџ“ћ Aloqa', async (ctx) => {
+    await ctx.reply(
+        'рџ“ћ <b>Bog\'lanish</b>\n\n' +
+        'рџЏ¦ <b>Markaziy filial:</b>\n' +
+        'рџ“Ќ Asosiy ko\'cha, 1\n' +
+        'рџ“± +998 71 123 45 67\n\n' +
+        'рџЏ¦ <b>Shimoliy filiali:</b>\n' +
+        'рџ“Ќ Shimoliy shoh ko\'chasi, 42\n' +
+        'рџ“± +998 71 234 56 78',
+        { parse_mode: 'HTML' }
+    );
+});
+
+// ================================================================
+//  XODIM вЂ” BOSHQARUV PANELI
+// ================================================================
+
+bot.hears('рџ“Љ Boshqaruv paneli', async (ctx) => {
+    if (!ctx.state.isStaff) return;
+    await sendStaffPanel(ctx, false);
+});
+
+bot.hears('рџ”„ Yangilash', async (ctx) => {
+    if (!ctx.state.isStaff) return;
+    await simulateFakeQueue();
+    await ctx.reply('рџ”„ Yangilandi!', STAFF_MENU);
+    await sendStaffPanel(ctx, false);
+});
+
+bot.hears('рџ“‹ Navbat ro\'yxati', async (ctx) => {
+    if (!ctx.state.isStaff) return;
+    await sendStaffQueueList(ctx);
+});
+
+bot.hears('вњ… Keyingisini chaqirish', async (ctx) => {
+    if (!ctx.state.isStaff) return;
+    // Birinchi navbatni topamiz
+    const branches = dbActions.getBranches();
+    let firstTicket = null;
+    let firstServiceId = null;
+
+    for (const b of branches) {
+        const services = dbActions.getServices(b.id);
+        for (const s of services) {
+            const t = dbActions.getNextTicket(s.id);
+            if (t) { firstTicket = t; firstServiceId = s.id; break; }
+        }
+        if (firstTicket) break;
+    }
+
+    if (!firstTicket) {
+        return ctx.reply('вњ… Hozir barcha navbatlar bo\'sh!', STAFF_MENU);
+    }
+
+    // Manage panel orqali chaqirish uchun foydalanuvchiga ko'rsatamiz
+    await sendStaffPanel(ctx, false);
+});
+
+bot.command('admin', async (ctx) => {
+    if (!ctx.state.isStaff) return ctx.reply('в›” Sizda ruxsat yo\'q.');
+    await sendStaffPanel(ctx, false);
+});
+
+async function sendStaffPanel(ctx, isEdit) {
+    const branches = dbActions.getBranches();
+    const rows = [];
+
+    branches.forEach(b => {
+        const services = dbActions.getServices(b.id);
+        services.forEach(s => {
+            const q = dbActions.getQueueLength(s.id);
+            const dot = q === 0 ? 'рџџў' : q < 5 ? 'рџџЎ' : 'рџ”ґ';
+            rows.push([Markup.button.callback(
+                `${dot} ${b.name} вЂє ${s.name}  (${q} navbat)`,
+                `mgr_${s.id}`
+            )]);
+        });
+    });
+
+    if (rows.length === 0) {
+        return ctx.reply('вљ пёЏ Mavjud xizmatlar topilmadi.', STAFF_MENU);
+    }
+
+    const totalWaiting = rows.length > 0
+        ? branches.reduce((sum, b) => {
+            const services = dbActions.getServices(b.id);
+            return sum + services.reduce((s2, s) => s2 + dbActions.getQueueLength(s.id), 0);
+        }, 0)
+        : 0;
+
+    const msg =
+        `рџ‘ЁвЂЌрџ’» <b>Xodimlar paneli</b>\n\n` +
+        `рџ“Љ Umumiy navbatda: <b>${totalWaiting} kishi</b>\n\n` +
+        `Boshqarish uchun navbatni tanlang:`;
+
+    const opts = { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) };
+
+    if (isEdit) return ctx.editMessageText(msg, opts).catch(() => ctx.reply(msg, opts));
+    return ctx.reply(msg, opts);
+}
+
+async function sendStaffQueueList(ctx) {
+    const branches = dbActions.getBranches();
+    let msg = `рџ“‹ <b>Barcha navbatlar</b>\n\n`;
+    let hasData = false;
+
+    branches.forEach(b => {
+        const services = dbActions.getServices(b.id);
+        services.forEach(s => {
+            const q = dbActions.getQueueLength(s.id);
+            if (q > 0) {
+                hasData = true;
+                msg += `рџЏў <b>${b.name}</b> вЂє ${s.name}: <b>${q} kishi</b>\n`;
+            }
+        });
+    });
+
+    if (!hasData) msg += 'вњ… Barcha navbatlar bo\'sh!';
+
+    await ctx.reply(msg, { parse_mode: 'HTML', ...STAFF_MENU });
+}
+
+// ================================================================
+//  XODIM вЂ” MANAGE SERVICE (inline)
+// ================================================================
+
+bot.action(/^mgr_(\d+)$/, async (ctx) => {
+    if (!ctx.state.isStaff) return ctx.answerCbQuery('в›” Ruxsat yo\'q');
+    await ctx.answerCbQuery();
+
+    const serviceId = parseInt(ctx.match[1]);
+    const service = dbActions.getServiceById(serviceId);
+    const branch = dbActions.getBranchByServiceId(serviceId);
+    const q = dbActions.getQueueLength(serviceId);
+    const nextTicket = dbActions.getNextTicket(serviceId);
+    const dot = q === 0 ? 'рџџў' : q < 5 ? 'рџџЎ' : 'рџ”ґ';
+
+    let msg =
+        `рџЏў <b>${branch ? branch.name : ''}</b> вЂє <b>${service ? service.name : ''}</b>\n\n` +
+        `${dot} Navbatda: <b>${q} kishi</b>\n`;
+
+    if (nextTicket) {
+        msg += `\nрџ‘¤ <b>Keyingi mijoz:</b> ${nextTicket.first_name || 'Noma\'lum'}\n`;
+        msg += `рџЋ« <b>Chipta:</b> <code>${nextTicket.ticket_number}</code>`;
+    } else {
+        msg += `\nвњ… Navbat bo'sh, hozir hech kim yo'q.`;
+    }
+
+    await ctx.editMessageText(msg, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback(`рџ“ў Keyingisini chaqirish`, `nxt_${serviceId}`)],
+            [Markup.button.callback('рџ”„ Yangilash', `mgr_${serviceId}`)],
+            [Markup.button.callback('рџ”™ Panelga qaytish', 'act_staff')]
+        ])
+    }).catch(() => { });
+});
+
+bot.action('act_staff', async (ctx) => {
+    if (!ctx.state.isStaff) return ctx.answerCbQuery('в›” Ruxsat yo\'q');
+    await ctx.answerCbQuery();
+    await sendStaffPanel(ctx, true);
+});
+
+// ================================================================
+//  KEYINGISINI CHAQIRISH (inline)
+// ================================================================
+
+bot.action(/^nxt_(\d+)$/, async (ctx) => {
+    if (!ctx.state.isStaff) return ctx.answerCbQuery('в›” Ruxsat yo\'q');
+    await ctx.answerCbQuery();
+
+    const serviceId = parseInt(ctx.match[1]);
+    const ticket = dbActions.getNextTicket(serviceId);
+
+    if (!ticket) {
+        return ctx.answerCbQuery('вњ… Hozir bu navbatda hech kim yo\'q.', { show_alert: true });
+    }
+
+    dbActions.callTicket(ticket.id);
+
+    try {
+        await bot.telegram.sendMessage(
+            ticket.telegram_id,
+            `рџ”” <b>NAVBATINGIZ KELDI!</b>\n\n` +
+            `в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n` +
+            `рџЋ« Chiptangiz: <code>${ticket.ticket_number}</code>\n` +
+            `в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n\n` +
+            `вљ пёЏ Iltimos, <b>darhol</b> xizmat oynasiga yaqinlashing!\n` +
+            `Kechikib qolsangiz, navbatingiz bekor qilinishi mumkin.`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err) {
+        console.error('Mijozga xabar yuborib bo\'lmadi:', err.message);
+    }
+
+    const service = dbActions.getServiceById(serviceId);
+
+    await ctx.editMessageText(
+        `рџ“ў <b>Mijoz chaqirildi!</b>\n\n` +
+        `в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n` +
+        `рџ‘¤ <b>Ism:</b>  ${ticket.first_name || 'Noma\'lum'}\n` +
+        `рџЋ« <b>Chipta:</b>  <code>${ticket.ticket_number}</code>\n` +
+        `рџ“‹ <b>Xizmat:</b>  ${service ? service.name : ''}\n` +
+        `в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n\n` +
+        `Xizmat tugagach В«вњ… YakunlashВ» tugmasini bosing.`,
+        {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('вњ… Xizmatni yakunlash', `done_${ticket.id}_${serviceId}`)],
+                [Markup.button.callback('вЏ­пёЏ Keyingisini chaqirish', `nxt_${serviceId}`)],
+                [Markup.button.callback('рџ”™ Navbatga qaytish', `mgr_${serviceId}`)]
+            ])
+        }
+    );
+});
+
+// ================================================================
+//  XIZMATNI YAKUNLASH
+// ================================================================
+
+bot.action(/^done_(\d+)_(\d+)$/, async (ctx) => {
+    if (!ctx.state.isStaff) return ctx.answerCbQuery('в›” Ruxsat yo\'q');
+    await ctx.answerCbQuery('вњ… Xizmat yakunlandi!');
+
+    const ticketId = parseInt(ctx.match[1]);
+    const serviceId = parseInt(ctx.match[2]);
+
+    dbActions.completeTicket(ticketId);
+
+    const service = dbActions.getServiceById(serviceId);
+    const q = dbActions.getQueueLength(serviceId);
+
+    await ctx.editMessageText(
+        `вњ… <b>Xizmat muvaffaqiyatli yakunlandi!</b>\n\n` +
+        `рџ“‹ Xizmat: <b>${service ? service.name : ''}</b>\n` +
+        `рџ‘Ґ Navbatda qoldi: <b>${q} kishi</b>`,
+        {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('рџ“ў Keyingisini chaqirish', `nxt_${serviceId}`)],
+                [Markup.button.callback('рџ”„ Navbatni yangilash', `mgr_${serviceId}`)],
+                [Markup.button.callback('рџ”™ Panel', 'act_staff')]
+            ])
+        }
+    );
+});
+
+// ================================================================
+//  XATOLAR
+// ================================================================
+
+bot.catch((err, ctx) => {
+    console.error(`[Xatolik] ${ctx.updateType}:`, err.message);
+});
+
+
+// ================================================================
+//  FAKE NAVBAT SIMULYATSIYASI (Demo uchun)
+//  Endi real vaqtga bog'liq emas.
+//  Har safar "Yangilash" bosilganda fake navbat 1 qadam oldinga yuradi.
+//  Shu orqali haqiqiy foydalanuvchilar ham progress ko'radi.
+// ================================================================
+
+// Fake user ID oralig'i (seed.js da yaratilgan)
+const FAKE_USER_MIN = 200001;
+const FAKE_USER_MAX = 200030;
+
+function isFakeUser(userId) {
+    return userId >= FAKE_USER_MIN && userId <= FAKE_USER_MAX;
+}
+
+
+// Yangilash bosilganda fake navbatni bitta qadam oldinga siljitamiz.
+// Real vaqtga bog'liq emas.
+async function simulateFakeQueue() {
+    try {
+        const db = dbActions.db;
+
+        const fakeTicket = db.prepare(`
+            SELECT t.*
+            FROM tickets t
+            WHERE t.status = 'waiting'
+              AND t.user_id >= ${FAKE_USER_MIN}
+              AND t.user_id <= ${FAKE_USER_MAX}
+            ORDER BY t.created_at ASC, t.id ASC
+            LIMIT 1
+        `).get();
+
+        if (!fakeTicket) {
+            refillFakeQueue(db);
+            return;
+        }
+
+        dbActions.callTicket(fakeTicket.id);
+        dbActions.completeTicket(fakeTicket.id);
+        console.log(`[Sim] Qadam bajarildi: ${fakeTicket.ticket_number} (xizmat #${fakeTicket.service_id})`);
+
+        await notifyRealUsersPositionChange(fakeTicket.service_id);
+    } catch (err) {
+        console.error('[Sim] Xatolik:', err.message);
+    }
+}
+
+// Haqiqiy foydalanuvchilarga pozitsiya o'zgargani haqida xabar
+async function notifyRealUsersPositionChange(serviceId) {
+    try {
+        const db = dbActions.db;
+        // Ushbu xizmatdagi haqiqiy foydalanuvchilar
+        const realTickets = db.prepare(`
+            SELECT t.*, u.telegram_id
+            FROM tickets t
+            JOIN users u ON t.user_id = u.telegram_id
+            WHERE t.service_id = ? AND t.status = 'waiting'
+              AND t.user_id < ${FAKE_USER_MIN}
+            ORDER BY t.created_at ASC
+        `).all(serviceId);
+
+        for (const rt of realTickets) {
+            const ahead = dbActions.getPeopleAhead(rt.id, serviceId);
+            // Faqat 0, 1, 2, 3 qolgan bo'lsa xabar yuboramiz
+            if (ahead <= 3) {
+                const msg = ahead === 0
+                    ? `рџ”” <b>Siz navbat boshidasiz!</b>\nрџЋ« Chipta: <code>${rt.ticket_number}</code>\n\nTez orada chaqirilasiz, tayyor bo'ling!`
+                    : `вљЎпёЏ <b>Navbatingiz yaqinlashdi!</b>\nрџЋ« Chipta: <code>${rt.ticket_number}</code>\nрџ‘Ґ Siz oldida: <b>${ahead} kishi</b>`;
+
+                await bot.telegram.sendMessage(rt.telegram_id, msg, { parse_mode: 'HTML' })
+                    .catch(() => { });
+            }
+        }
+    } catch (err) { /* ignore */ }
+}
+
+// Fake ticketlar tugaganda yangi navbat yaratish
+function refillFakeQueue(db) {
+    try {
+        const services = db.prepare('SELECT * FROM services').all();
+        if (services.length === 0) return;
+
+        const prefixes = {
+            'Kassa xizmati': 'K', 'Kredit bo\'limi': 'KR', 'Karta xizmati': 'P',
+            'Depozit bo\'limi': 'D', 'Pul o\'tkazmalari': 'T', 'Valyuta almashtirish': 'V'
+        };
+
+        const insTicket = db.prepare(
+            "INSERT INTO tickets (user_id, service_id, ticket_number, status) VALUES (?, ?, ?, 'waiting')"
+        );
+        const insUser = db.prepare(
+            'INSERT OR IGNORE INTO users (telegram_id, username, first_name, role) VALUES (?, ?, ?, ?)'
+        );
+
+        const names = ['Anvar', 'Barno', 'Diyora', 'Eldor', 'Farzona', 'Gulsanam', 'Hamza', 'Iroda'];
+        let uid = FAKE_USER_MIN + Math.floor(Math.random() * 1000) + 100;
+
+        // Har bir xizmatga 2-4 ta yangi fake ticket
+        for (const svc of services.slice(0, 6)) {
+            const count = 2 + Math.floor(Math.random() * 3);
+            for (let i = 0; i < count; i++) {
+                uid++;
+                const name = names[Math.floor(Math.random() * names.length)];
+                insUser.run(uid, `user_${uid}`, name, 'client');
+                const prefix = svc.prefix || 'T';
+                const total = db.prepare('SELECT COUNT(*) as c FROM tickets WHERE service_id=?').get(svc.id).c;
+                insTicket.run(uid, svc.id, `${prefix}-${total + 1}`);
+            }
+        }
+        console.log('рџ”„ [Sim] Yangi fake ticketlar yaratildi.');
+    } catch (err) { console.error('[Sim] Refill xatolik:', err.message); }
+}
+
+// ================================================================
+//  ISHGA TUSHIRISH
+// ================================================================
+
+bot.launch().then(() => {
+    console.log('вњ… Bot ishga tushdi!');
+    console.log(`рџ‘Ґ Xodimlar: ${STAFF_IDS.length > 0 ? STAFF_IDS.join(', ') : 'Belgilanmagan'}`);
+
+    console.log('🎭 Fake navbat simulyatsiyasi yangilash tugmasi orqali ishlaydi');
+
+}).catch(err => {
+    console.error('вќЊ Bot ishga tushmadi:', err.message);
+});
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+
