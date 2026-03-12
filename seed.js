@@ -1,11 +1,11 @@
-/**
- * seed.js — Demo uchun to'liq fake ma'lumotlar yaratish
+﻿/**
+ * seed.js вЂ” Demo uchun to'liq fake ma'lumotlar yaratish
  * 
  * Ishga tushirish: node seed.js
  * 
  * Bu script:
  * 1. Eski barcha ma'lumotlarni o'chiradi
- * 2. 8 ta filial, 22 ta xizmat yaratadi
+ * 2. 8 ta filial, 28 ta xizmat yaratadi
  * 3. 31 ta fake foydalanuvchi qo'shadi
  * 4. Turli holatlardagi chiptalar yaratadi (waiting, called, completed)
  */
@@ -70,7 +70,7 @@ if (!branchColumns.includes('institution_id')) {
   db.exec('ALTER TABLE branches ADD COLUMN institution_id INTEGER');
 }
 
-console.log('🗑️  Eski ma\'lumotlar o\'chirilmoqda...');
+console.log('рџ—‘пёЏ  Eski ma\'lumotlar o\'chirilmoqda...');
 
 // Barcha jadvaldagi ma'lumotlarni tozalash
 db.exec(`
@@ -83,7 +83,7 @@ db.exec(`
   DELETE FROM sqlite_sequence WHERE name IN ('tickets','users','services','branches','institutions','organizations');
 `);
 
-console.log('✅ Tozalandi.\n');
+console.log('вњ… Tozalandi.\n');
 
 // ================================================================
 //  FILIALLAR
@@ -112,7 +112,7 @@ const b6 = insertBranch.run(orgBank, bankXalq, 'XalqBank Mirzo Ulugbek filiali',
 const b7 = insertBranch.run(orgHospital, null, 'Markaziy shifoxona', 'Sog\'liq ko\'chasi, 12').lastInsertRowid;
 const b8 = insertBranch.run(orgTax, null, 'Soliq markazi', 'Istiqlol ko\'chasi, 21').lastInsertRowid;
 
-console.log(`🏢 8 ta filial yaratildi.`);
+console.log(`рџЏў 8 ta filial yaratildi.`);
 
 // ================================================================
 //  XIZMATLAR
@@ -128,24 +128,30 @@ const s_d1 = ins.run(b1, 'Depozit bo\'limi', 'D').lastInsertRowid;
 
 // AloqaBank Chilonzor
 const s_k2 = ins.run(b2, 'Kassa xizmati', 'K').lastInsertRowid;
+const s_kr2 = ins.run(b2, 'Kredit bo\'limi', 'KR').lastInsertRowid;
 const s_t2 = ins.run(b2, 'Pul o\'tkazmalari', 'T').lastInsertRowid;
 const s_p2 = ins.run(b2, 'Karta xizmati', 'P').lastInsertRowid;
 
 // KapitalBank Yunusobod
 const s_k3 = ins.run(b3, 'Kassa xizmati', 'K').lastInsertRowid;
 const s_kr3 = ins.run(b3, 'Kredit bo\'limi', 'KR').lastInsertRowid;
+const s_p3 = ins.run(b3, 'Karta xizmati', 'P').lastInsertRowid;
 const s_v3 = ins.run(b3, 'Valyuta almashtirish', 'V').lastInsertRowid;
 
 // KapitalBank Sergeli
 const s_k4 = ins.run(b4, 'Kassa xizmati', 'K').lastInsertRowid;
+const s_kr4 = ins.run(b4, 'Kredit bo\'limi', 'KR').lastInsertRowid;
+const s_p4 = ins.run(b4, 'Karta xizmati', 'P').lastInsertRowid;
 const s_t4 = ins.run(b4, 'Pul o\'tkazmalari', 'T').lastInsertRowid;
 
 // XalqBank Shayxontohur
 const s_k5 = ins.run(b5, 'Kassa xizmati', 'K').lastInsertRowid;
 const s_kr5 = ins.run(b5, 'Kredit bo\'limi', 'KR').lastInsertRowid;
+const s_p5 = ins.run(b5, 'Karta xizmati', 'P').lastInsertRowid;
 
 // XalqBank Mirzo Ulugbek
 const s_k6 = ins.run(b6, 'Kassa xizmati', 'K').lastInsertRowid;
+const s_kr6 = ins.run(b6, 'Kredit bo\'limi', 'KR').lastInsertRowid;
 const s_p6 = ins.run(b6, 'Karta xizmati', 'P').lastInsertRowid;
 
 // Shifoxona
@@ -158,7 +164,7 @@ const s_s6 = ins.run(b8, 'Soliq maslahati', 'S').lastInsertRowid;
 const s_d6 = ins.run(b8, 'Deklaratsiya qabuli', 'D').lastInsertRowid;
 const s_n6 = ins.run(b8, 'STIR bo\'yicha xizmat', 'N').lastInsertRowid;
 
-console.log(`📋 22 ta xizmat yaratildi.`);
+console.log(`📋 28 ta xizmat yaratildi.`);
 
 // ================================================================
 //  FAKE FOYDALANUVCHILAR (31 ta)
@@ -204,10 +210,10 @@ const fakeUsers = [
 ];
 
 fakeUsers.forEach(u => insUser.run(...u));
-console.log(`👥 ${fakeUsers.length} ta fake foydalanuvchi yaratildi.`);
+console.log(`рџ‘Ґ ${fakeUsers.length} ta fake foydalanuvchi yaratildi.`);
 
 // ================================================================
-//  CHIPTALAR — turli holatlarda
+//  CHIPTALAR вЂ” turli holatlarda
 // ================================================================
 
 const insTkt = db.prepare(
@@ -215,63 +221,94 @@ const insTkt = db.prepare(
      VALUES (?, ?, ?, ?, ?, ?, ?)`
 );
 
-const now = new Date().toISOString();
 const ago = (min) => new Date(Date.now() - min * 60 * 1000).toISOString();
 
-// --- Markaziy filial: Kassa — 6 kishi navbatda, 2 ta yakunlangan ---
-insTkt.run(200001, s_k1, 'K-1', 'completed', ago(60), ago(55), ago(48));
-insTkt.run(200002, s_k1, 'K-2', 'completed', ago(50), ago(44), ago(38));
-insTkt.run(200003, s_k1, 'K-3', 'waiting', ago(40), null, null);
-insTkt.run(200004, s_k1, 'K-4', 'waiting', ago(35), null, null);
-insTkt.run(200005, s_k1, 'K-5', 'waiting', ago(30), null, null);
-insTkt.run(200006, s_k1, 'K-6', 'waiting', ago(25), null, null);
-insTkt.run(200007, s_k1, 'K-7', 'waiting', ago(20), null, null);
-insTkt.run(200008, s_k1, 'K-8', 'waiting', ago(15), null, null);
+// Har bir xizmat uchun "o'rtacha" navbat:
+// waiting: 2-3 ta, called: ayrim xizmatlarda 1 ta, completed: 1 ta
+const allServices = db.prepare(`
+    SELECT s.id, s.prefix
+    FROM services s
+    ORDER BY s.id
+`).all();
 
-// --- Markaziy filial: Kredit — 3 kishi ---
-insTkt.run(200009, s_kr1, 'KR-1', 'completed', ago(90), ago(80), ago(70));
-insTkt.run(200010, s_kr1, 'KR-2', 'called', ago(30), ago(5), null);   // ← chaqirilgan!
-insTkt.run(200011, s_kr1, 'KR-3', 'waiting', ago(20), null, null);
-insTkt.run(200012, s_kr1, 'KR-4', 'waiting', ago(10), null, null);
+const insertUserAuto = db.prepare(
+    'INSERT OR IGNORE INTO users (telegram_id, username, first_name, role) VALUES (?, ?, ?, ?)'
+);
 
-// --- Markaziy filial: Karta ---
-insTkt.run(200013, s_p1, 'P-1', 'completed', ago(45), ago(40), ago(32));
-insTkt.run(200014, s_p1, 'P-2', 'waiting', ago(25), null, null);
-insTkt.run(200015, s_p1, 'P-3', 'waiting', ago(15), null, null);
+const autoNames = [
+    'Alisher', 'Malika', 'Jasur', 'Nilufar', 'Bobur', 'Zulfiya', 'Sardor', 'Gulnora',
+    'Firdavs', 'Shahnoza', 'Ulugbek', 'Dilorom', 'Sherzod', 'Feruza', 'Kamol', 'Ozoda'
+];
 
-// --- Markaziy filial: Depozit ---
-insTkt.run(200016, s_d1, 'D-1', 'waiting', ago(10), null, null);
+let nextUid = 200031;
+let totalTickets = 0;
 
-// --- Shimoliy filiali: Kassa — 4 kishi ---
-insTkt.run(200017, s_k2, 'K-1', 'completed', ago(55), ago(48), ago(40));
-insTkt.run(200018, s_k2, 'K-2', 'waiting', ago(35), null, null);
-insTkt.run(200019, s_k2, 'K-3', 'waiting', ago(25), null, null);
-insTkt.run(200020, s_k2, 'K-4', 'waiting', ago(15), null, null);
-insTkt.run(200021, s_k2, 'K-5', 'waiting', ago(5), null, null);
+function nextFakeUserId() {
+    nextUid += 1;
+    const name = autoNames[nextUid % autoNames.length];
+    insertUserAuto.run(nextUid, `user_${nextUid}`, name, 'client');
+    return nextUid;
+}
 
-// --- Shimoliy filiali: O'tkazmalar ---
-insTkt.run(200022, s_t2, 'T-1', 'called', ago(20), ago(3), null);   // ← chaqirilgan!
-insTkt.run(200023, s_t2, 'T-2', 'waiting', ago(15), null, null);
+allServices.forEach((svc, index) => {
+    let seq = 1;
+    const completedCount = 1;
+    const calledCount = (svc.id % 4 === 0) ? 1 : 0;
+    const waitingCount = 2 + (svc.id % 3 === 0 ? 1 : 0);
 
-// --- Yunusobod filiali: Valyuta ---
-insTkt.run(200024, s_v3, 'V-1', 'waiting', ago(12), null, null);
-insTkt.run(200025, s_v3, 'V-2', 'waiting', ago(8), null, null);
+    // completed
+    for (let i = 0; i < completedCount; i++) {
+        const userId = nextFakeUserId();
+        const createdMin = 220 + (index * 5) + (i * 10);
+        const calledMin = createdMin - 8;
+        const doneMin = calledMin - 7;
+        insTkt.run(
+            userId,
+            svc.id,
+            `${svc.prefix}-${seq++}`,
+            'completed',
+            ago(createdMin),
+            ago(calledMin),
+            ago(doneMin)
+        );
+        totalTickets += 1;
+    }
 
-// --- Chilonzor filiali: Kassa ---
-insTkt.run(200026, s_k4, 'K-1', 'completed', ago(80), ago(72), ago(60));
-insTkt.run(200027, s_k4, 'K-2', 'waiting', ago(18), null, null);
-insTkt.run(200028, s_k4, 'K-3', 'waiting', ago(10), null, null);
+    // called
+    for (let i = 0; i < calledCount; i++) {
+        const userId = nextFakeUserId();
+        const createdMin = 65 + (index % 7) + (i * 4);
+        const calledMin = 9 + (i * 2);
+        insTkt.run(
+            userId,
+            svc.id,
+            `${svc.prefix}-${seq++}`,
+            'called',
+            ago(createdMin),
+            ago(calledMin),
+            null
+        );
+        totalTickets += 1;
+    }
 
-// --- Chilonzor filiali: O'tkazmalar ---
-insTkt.run(200029, s_t4, 'T-1', 'waiting', ago(5), null, null);
+    // waiting
+    for (let i = 0; i < waitingCount; i++) {
+        const userId = nextFakeUserId();
+        const createdMin = 35 - (i * 7) + (index % 6);
+        insTkt.run(
+            userId,
+            svc.id,
+            `${svc.prefix}-${seq++}`,
+            'waiting',
+            ago(createdMin),
+            null,
+            null
+        );
+        totalTickets += 1;
+    }
+});
 
-// --- Shifoxona: Qabul ---
-insTkt.run(200030, s_h5, 'H-1', 'waiting', ago(2), null, null);
-
-// --- Soliq: Maslahat ---
-insTkt.run(200031, s_s6, 'S-1', 'waiting', ago(1), null, null);
-
-console.log(`🎫 31 ta chipta yaratildi (waiting, called, completed).\n`);
+console.log(`🎫 ${totalTickets} ta chipta yaratildi (waiting, called, completed).\n`);
 
 // ================================================================
 //  STATISTIKA
@@ -284,10 +321,10 @@ const stats = db.prepare(`
         (SELECT COUNT(*) FROM tickets WHERE status='completed') as completed
 `).get();
 
-console.log('📊 Statistika:');
-console.log(`   ⏳ Kutilmoqda:   ${stats.waiting} ta`);
-console.log(`   🔔 Chaqirilgan:  ${stats.called} ta`);
-console.log(`   ✅ Yakunlangan:  ${stats.completed} ta`);
-console.log('\n🚀 Demo ma\'lumotlar tayyor! Endi: npm start\n');
+console.log('рџ“Љ Statistika:');
+console.log(`   вЏі Kutilmoqda:   ${stats.waiting} ta`);
+console.log(`   рџ”” Chaqirilgan:  ${stats.called} ta`);
+console.log(`   вњ… Yakunlangan:  ${stats.completed} ta`);
+console.log('\nрџљЂ Demo ma\'lumotlar tayyor! Endi: npm start\n');
 
 db.close();

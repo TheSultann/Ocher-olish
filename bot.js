@@ -38,6 +38,8 @@ const TRANSFER_SUPPORT = {
     }
 };
 
+const pendingCustomSchedule = new Map();
+
 // ================================================================
 //  MIDDLEWARE
 // ================================================================
@@ -147,6 +149,91 @@ function renderBankList(bankNames, branchMap) {
     }).join('\n');
 }
 
+function formatDateTimeUz(dateValue) {
+    const date = new Date(dateValue);
+    if (Number.isNaN(date.getTime())) return '-';
+    return date.toLocaleString('uz-UZ', {
+        timeZone: 'Asia/Tashkent',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+    });
+}
+
+function buildTashkentDateIso(year, month, day, hour, minute) {
+    const y = String(year).padStart(4, '0');
+    const m = String(month).padStart(2, '0');
+    const d = String(day).padStart(2, '0');
+    const hh = String(hour).padStart(2, '0');
+    const mm = String(minute).padStart(2, '0');
+    return `${y}-${m}-${d}T${hh}:${mm}:00+05:00`;
+}
+
+function getTashkentNowParts() {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Tashkent',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+    }).formatToParts(new Date());
+
+    const value = (type) => Number(parts.find(p => p.type === type)?.value || 0);
+    return {
+        year: value('year'),
+        month: value('month'),
+        day: value('day')
+    };
+}
+
+function parseCustomScheduleInput(text) {
+    const input = String(text || '').trim();
+    if (!input) {
+        return { ok: false, error: `Vaqt yuborilmadi.` };
+    }
+
+    const hhmm = input.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+    if (!hhmm) {
+        return {
+            ok: false,
+            error:
+                `Faqat vaqt kiriting: <code>HH:MM</code>\n` +
+                `Namuna: <code>17:30</code>`
+        };
+    }
+
+    const { year, month, day } = getTashkentNowParts();
+    const hour = Number(hhmm[1]);
+    const minute = Number(hhmm[2]);
+    let planned = new Date(buildTashkentDateIso(year, month, day, hour, minute));
+    if (planned.getTime() <= Date.now()) {
+        planned = new Date(planned.getTime() + 24 * 60 * 60 * 1000);
+    }
+
+    const diff = planned.getTime() - Date.now();
+    if (diff < 5 * 60 * 1000) {
+        return {
+            ok: false,
+            error: `Vaqt kamida 5 daqiqa oldinda bo'lishi kerak.`
+        };
+    }
+
+    const maxDiff = 7 * 24 * 60 * 60 * 1000;
+    if (diff > maxDiff) {
+        return {
+            ok: false,
+            error: `Hozircha faqat 7 kun ichidagi vaqtni tanlash mumkin.`
+        };
+    }
+
+    return { ok: true, plannedAt: planned.toISOString() };
+}
+
 async function sendTransferMenu(ctx, isEdit = false) {
     const text =
         `🌍 <b>Международный перевод</b>\n\n` +
@@ -198,6 +285,22 @@ async function sendBankQueueMenu(ctx, isEdit = false, backCallback = 'act_orgs')
 
 bot.hears('🎫 Navbat olish', async (ctx) => {
     if (ctx.state.isStaff) return;
+
+    const activeTicket = dbActions.getActiveTicket(ctx.from.id);
+    if (activeTicket) {
+        return ctx.reply(
+            `ℹ️ <b>Sizda allaqachon faol chipta bor.</b>\n\n` +
+            `Yangi chipta olishdan oldin joriy chiptani yakunlang yoki bekor qiling.`,
+            {
+                parse_mode: 'HTML',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('📋 Chiptamni ko\'rish', 'act_myticket')],
+                    [Markup.button.callback('❌ Chiptani bekor qilish', `cxl_${activeTicket.id}`)]
+                ])
+            }
+        );
+    }
+
     await sendOrganizationsMenu(ctx);
 });
 
@@ -403,24 +506,76 @@ bot.action(/^br_(\d+)$/, async (ctx) => {
 // ================================================================
 
 bot.action(/^svc_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
     const serviceId = parseInt(ctx.match[1]);
+    const service = dbActions.getServiceById(serviceId);
+
+    if (!service) {
+        return ctx.answerCbQuery('❌ Xizmat topilmadi.', { show_alert: true });
+    }
+
+    const activeTicket = dbActions.getActiveTicket(ctx.from.id);
+    if (activeTicket) {
+        await ctx.answerCbQuery('ℹ️ Sizda allaqachon faol chipta bor!', { show_alert: true });
+        return sendMyTicket(ctx, true);
+    }
+
+    const branch = dbActions.getBranchByServiceId(serviceId);
+    const rows = [
+        [Markup.button.callback('⚡ Hozir', `slot_${serviceId}_0`)],
+        [Markup.button.callback('🕒 Vaqtni o\'zim tanlayman', `slot_custom_${serviceId}`)],
+        [Markup.button.callback('🔙 Xizmatlarga qaytish', branch ? `br_${branch.id}` : 'act_orgs')]
+    ];
+
+    await ctx.editMessageText(
+        `⏰ <b>Navbat vaqtini tanlang</b>\n\n` +
+        `📋 Xizmat: <b>${service.name}</b>\n` +
+        `Hozir olishingiz yoki o'zingiz qulay vaqtni kiritishingiz mumkin.`,
+        { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }
+    ).catch(() => {});
+});
+
+bot.action(/^slot_(\d+)_(\d+)$/, async (ctx) => {
+    const serviceId = parseInt(ctx.match[1]);
+    const offsetHours = parseInt(ctx.match[2]);
+
+    if (Number.isNaN(serviceId) || Number.isNaN(offsetHours)) {
+        return ctx.answerCbQuery('❌ Notog\'ri parametr.', { show_alert: true });
+    }
+
+    const plannedAt = offsetHours > 0
+        ? new Date(Date.now() + offsetHours * 60 * 60 * 1000).toISOString()
+        : null;
 
     try {
-        const ticket = dbActions.createTicket(ctx.from.id, serviceId);
-        const peopleAhead = dbActions.getVirtualPeopleAhead(ticket.id, serviceId);
-        const waitTime = dbActions.getWaitEstimate(ticket.id, serviceId);
-
+        const ticket = dbActions.createTicket(ctx.from.id, serviceId, plannedAt);
         await ctx.answerCbQuery('✅ Navbatga yozildingiz!');
 
-        const msg =
-            `✅ <b>Navbatga muvaffaqiyatli yozildingiz!</b>\n\n` +
-            `━━━━━━━━━━━━━━━━\n` +
-            `🎫 <b>Chipta raqami:</b>  <code>${ticket.ticket_number}</code>\n` +
-            `👥 <b>Siz oldida:</b>  ${peopleAhead} kishi\n` +
-            `⏳ <b>Taxminiy kutish:</b>  ~${waitTime} daqiqa\n` +
-            `━━━━━━━━━━━━━━━━\n\n` +
-            `🔔 Navbatingiz kelganda <b>avtomatik xabar</b> yuboriladi.\n` +
-            `Tashkilotga o'z vaqtida keling! 🏛`;
+        let msg;
+        if (ticket.status === 'scheduled') {
+            const startIn = dbActions.getWaitEstimate(ticket.id, serviceId);
+            const plannedText = formatDateTimeUz(ticket.planned_at);
+            msg =
+                `✅ <b>Navbat oldindan band qilindi!</b>\n\n` +
+                `━━━━━━━━━━━━━━━━\n` +
+                `🎫 <b>Chipta raqami:</b>  <code>${ticket.ticket_number}</code>\n` +
+                `🗓 <b>Belgilangan vaqt:</b>  ${plannedText}\n` +
+                `⏳ <b>Boshlanishigacha:</b>  ~${startIn} daqiqa\n` +
+                `━━━━━━━━━━━━━━━━\n\n` +
+                `Belgilangan vaqtdan 10-15 daqiqa oldin kelishni tavsiya qilamiz.`;
+        } else {
+            const peopleAhead = dbActions.getVirtualPeopleAhead(ticket.id, serviceId);
+            const waitTime = dbActions.getWaitEstimate(ticket.id, serviceId);
+            msg =
+                `✅ <b>Navbatga muvaffaqiyatli yozildingiz!</b>\n\n` +
+                `━━━━━━━━━━━━━━━━\n` +
+                `🎫 <b>Chipta raqami:</b>  <code>${ticket.ticket_number}</code>\n` +
+                `👥 <b>Siz oldida:</b>  ${peopleAhead} kishi\n` +
+                `⏳ <b>Taxminiy kutish:</b>  ~${waitTime} daqiqa\n` +
+                `━━━━━━━━━━━━━━━━\n\n` +
+                `🔔 Navbatingiz kelganda <b>avtomatik xabar</b> yuboriladi.\n` +
+                `Tashkilotga o'z vaqtida keling! 🏛`;
+        }
 
         await ctx.editMessageText(msg, {
             parse_mode: 'HTML',
@@ -429,7 +584,6 @@ bot.action(/^svc_(\d+)$/, async (ctx) => {
                 [Markup.button.callback('❌ Chiptani bekor qilish', `cxl_${ticket.id}`)]
             ])
         });
-
     } catch (err) {
         if (err.message === 'Siz allaqachon navbatdasiz') {
             await ctx.answerCbQuery('ℹ️ Sizda allaqachon faol chipta bor!', { show_alert: true });
@@ -437,6 +591,113 @@ bot.action(/^svc_(\d+)$/, async (ctx) => {
         } else {
             console.error('createTicket error:', err.message);
             await ctx.answerCbQuery('❌ Xatolik yuz berdi, qayta urinib ko\'ring.', { show_alert: true });
+        }
+    }
+});
+
+bot.action(/^slot_custom_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const serviceId = parseInt(ctx.match[1]);
+    const service = dbActions.getServiceById(serviceId);
+    if (!service) {
+        return ctx.answerCbQuery('❌ Xizmat topilmadi.', { show_alert: true });
+    }
+
+    pendingCustomSchedule.set(ctx.from.id, { serviceId });
+
+    const msg =
+        `🕒 <b>Vaqtni kiriting</b>\n\n` +
+        `📋 Xizmat: <b>${service.name}</b>\n` +
+        `Faqat shu formatda yuboring: <code>HH:MM</code>\n` +
+        `Masalan: <code>17:30</code>\n\n` +
+        `⏱ Toshkent vaqti (UTC+5).\n` +
+        `Agar vaqt bugun o'tib ketgan bo'lsa, ertangi kunga olinadi.`;
+
+    await ctx.editMessageText(msg, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback('❌ Bekor qilish', 'slot_custom_cancel')]
+        ])
+    }).catch(() => {});
+});
+
+bot.action('slot_custom_cancel', async (ctx) => {
+    await ctx.answerCbQuery();
+    pendingCustomSchedule.delete(ctx.from.id);
+    await ctx.editMessageText(
+        `❌ <b>Vaqt tanlash bekor qilindi.</b>\n` +
+        `Qaytadan navbat olishingiz mumkin.`,
+        {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🎫 Navbat olish', 'act_orgs')]
+            ])
+        }
+    ).catch(() => {});
+});
+
+bot.on('text', async (ctx, next) => {
+    if (!ctx.from || ctx.state.isStaff) return next();
+
+    const pending = pendingCustomSchedule.get(ctx.from.id);
+    if (!pending) return next();
+
+    const text = (ctx.message && ctx.message.text ? ctx.message.text : '').trim();
+    const menuTexts = new Set([
+        '🎫 Navbat olish',
+        '📋 Mening chiptam',
+        'ℹ️ Ma\'lumot',
+        '📞 Aloqa',
+        '🌍 Xalqaro o\'tkazma',
+        '🌍 Международный перевод'
+    ]);
+
+    if (text.startsWith('/') || menuTexts.has(text)) {
+        pendingCustomSchedule.delete(ctx.from.id);
+        return next();
+    }
+
+    const parsed = parseCustomScheduleInput(text);
+    if (!parsed.ok) {
+        await ctx.reply(
+            `⚠️ ${parsed.error}\n\n` +
+            `Qayta kiriting yoki «Bekor qilish» tugmasini bosing.`,
+            { parse_mode: 'HTML' }
+        );
+        return;
+    }
+
+    try {
+        const ticket = dbActions.createTicket(ctx.from.id, pending.serviceId, parsed.plannedAt);
+        pendingCustomSchedule.delete(ctx.from.id);
+
+        const startIn = dbActions.getWaitEstimate(ticket.id, pending.serviceId);
+        const plannedText = formatDateTimeUz(ticket.planned_at);
+
+        const msg =
+            `✅ <b>Navbat oldindan band qilindi!</b>\n\n` +
+            `━━━━━━━━━━━━━━━━\n` +
+            `🎫 <b>Chipta:</b> <code>${ticket.ticket_number}</code>\n` +
+            `🗓 <b>Belgilangan vaqt:</b> ${plannedText}\n` +
+            `⏳ <b>Boshlanishigacha:</b> ~${startIn} daqiqa\n` +
+            `━━━━━━━━━━━━━━━━\n\n` +
+            `Belgilangan vaqtdan 10-15 daqiqa oldin kelishni tavsiya qilamiz.`;
+
+        await ctx.reply(msg, {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('📋 Chiptamni ko\'rish', 'act_myticket')],
+                [Markup.button.callback('❌ Chiptani bekor qilish', `cxl_${ticket.id}`)]
+            ])
+        });
+    } catch (err) {
+        if (err.message === 'Siz allaqachon navbatdasiz') {
+            pendingCustomSchedule.delete(ctx.from.id);
+            await ctx.reply('ℹ️ Sizda allaqachon faol chipta bor.', { parse_mode: 'HTML' });
+            await sendMyTicket(ctx, false);
+        } else {
+            console.error('custom schedule error:', err.message);
+            await ctx.reply('❌ Xatolik yuz berdi, qayta urinib ko\'ring.');
         }
     }
 });
@@ -457,7 +718,7 @@ bot.action('act_myticket', async (ctx) => {
 });
 
 async function sendMyTicket(ctx, isEdit, isRefresh = false) {
-    const ticket = dbActions.getActiveTicket(ctx.from.id);
+    let ticket = dbActions.getActiveTicket(ctx.from.id);
 
     if (!ticket) {
         const text =
@@ -473,12 +734,28 @@ async function sendMyTicket(ctx, isEdit, isRefresh = false) {
         return ctx.reply(text, opts);
     }
 
-    if (isRefresh && ticket.status === 'waiting') {
+    if (isRefresh && (ticket.status === 'waiting' || ticket.status === 'scheduled')) {
         dbActions.decrementWaitOnRefresh(ticket.id);
+        ticket = dbActions.getActiveTicket(ctx.from.id);
+        if (!ticket) {
+            const text =
+                `❌ <b>Faol chiptangiz yo'q</b>\n\n` +
+                `Navbat olish uchun «🎫 Navbat olish» tugmasini bosing.`;
+            const opts = {
+                parse_mode: 'HTML',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('🎫 Navbat olish', 'act_orgs')]
+                ])
+            };
+            if (isEdit) return ctx.editMessageText(text, opts).catch(() => ctx.reply(text, opts));
+            return ctx.reply(text, opts);
+        }
     }
 
     const waitTime = dbActions.getWaitEstimate(ticket.id, ticket.service_id);
-    const peopleAhead = dbActions.getVirtualPeopleAhead(ticket.id, ticket.service_id);
+    const peopleAhead = ticket.status === 'scheduled'
+        ? 0
+        : dbActions.getVirtualPeopleAhead(ticket.id, ticket.service_id);
 
     // --- Vizualizatsiya ---
 
@@ -486,6 +763,8 @@ async function sendMyTicket(ctx, isEdit, isRefresh = false) {
     let statusLine;
     if (ticket.status === 'called') {
         statusLine = `🔔 <b>SIZNI CHAQIRISHMOQDA!</b>`;
+    } else if (ticket.status === 'scheduled') {
+        statusLine = `🗓 <b>Vaqtga band qilingan</b>`;
     } else if (peopleAhead === 0) {
         statusLine = `✅ <b>Navbat boshidasiz!</b>`;
     } else {
@@ -514,6 +793,9 @@ async function sendMyTicket(ctx, isEdit, isRefresh = false) {
 
     if (ticket.status === 'called') {
         msg += `\n⚠️ Iltimos, xizmat oynasiga <b>darhol yaqinlashing!</b>\n`;
+    } else if (ticket.status === 'scheduled') {
+        msg += `\n🗓 <b>Belgilangan vaqt:</b> ${formatDateTimeUz(ticket.planned_at)}\n`;
+        msg += `⏳ <b>Boshlanishigacha:</b> ~${waitTime} daqiqa\n`;
     } else if (peopleAhead === 0) {
         msg += `\n🎉 <b>Siz birinchisiz!</b> Tez orada chaqirilasiz.\n`;
         msg += `⏳ <b>Taxminiy kutish:</b>  ~${waitTime} daqiqa\n`;
@@ -608,7 +890,8 @@ bot.hears('ℹ️ Ma\'lumot', async (ctx) => {
         '3️⃣ (Bank bo\'lsa) bankni tanlang\n' +
         '4️⃣ Filialni tanlang\n' +
         '5️⃣ Xizmat turini tanlang\n' +
-        '6️⃣ Navbatingiz kelganda sizga xabar yuboriladi!\n\n' +
+        '6️⃣ Vaqtni tanlang (hozir yoki oldindan)\n' +
+        '7️⃣ Navbatingiz kelganda sizga xabar yuboriladi!\n\n' +
         '🌍 «Международный перевод» bo\'limida 8 yoki 9 kod formati bo\'yicha banklar ro\'yxatini ko\'rasiz.\n\n' +
         '⏰ <b>Ish vaqti:</b> 09:00 — 18:00 (Du-Ju)',
         { parse_mode: 'HTML' }
@@ -616,14 +899,25 @@ bot.hears('ℹ️ Ma\'lumot', async (ctx) => {
 });
 
 bot.hears('📞 Aloqa', async (ctx) => {
+    const bankContacts = [
+        { name: 'AloqaBank', phone: '+998 71 123 45 67' },
+        { name: 'KapitalBank', phone: '+998 71 234 56 78' },
+        { name: 'XalqBank', phone: '+998 71 345 67 89' }
+    ];
+
+    const bankList = bankContacts.map(b => `• ${b.name} — 📱 ${b.phone}`).join('\n');
+    const hospitalList = '• Markaziy shifoxona — 📱 +998 71 456 78 90';
+    const taxList = '• Soliq markazi — 📱 +998 71 567 89 01';
+
     await ctx.reply(
-        '📞 <b>Bog\'lanish</b>\n\n' +
-        '🏦 <b>Markaziy filial:</b>\n' +
-        '📍 Asosiy ko\'cha, 1\n' +
-        '📱 +998 71 123 45 67\n\n' +
-        '🏦 <b>Shimoliy filiali:</b>\n' +
-        '📍 Shimoliy shoh ko\'chasi, 42\n' +
-        '📱 +998 71 234 56 78',
+        '📞 <b>Bog\'lanish markazi</b>\n\n' +
+        '☎️ <b>Call-center:</b> +998 71 123 45 67\n' +
+        '📱 <b>Telegram:</b> @support_navbat\n' +
+        '🕘 <b>Ish vaqti:</b> 09:00 — 18:00 (Du-Ju)\n\n' +
+        '🏦 <b>Banklar:</b>\n' + bankList + '\n\n' +
+        '🏥 <b>Shifoxona filiallari:</b>\n' + hospitalList + '\n\n' +
+        '🏛 <b>Soliq filiallari:</b>\n' + taxList + '\n\n' +
+        'ℹ️ Aniq manzil uchun «🎫 Navbat olish» orqali filialni tanlang.',
         { parse_mode: 'HTML' }
     );
 });

@@ -95,6 +95,26 @@ function ensureTicketColumns() {
   if (!columns.includes('refresh_wait_minutes')) {
     db.exec('ALTER TABLE tickets ADD COLUMN refresh_wait_minutes INTEGER');
   }
+  if (!columns.includes('planned_at')) {
+    db.exec('ALTER TABLE tickets ADD COLUMN planned_at DATETIME');
+  }
+}
+
+function parsePlannedAtMs(value) {
+  if (!value) return Number.NaN;
+  const raw = String(value).trim();
+  if (!raw) return Number.NaN;
+
+  let ms = Date.parse(raw);
+  if (!Number.isNaN(ms)) return ms;
+
+  // SQLite datetime() natijasi: "YYYY-MM-DD HH:MM:SS"
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)) {
+    ms = Date.parse(raw.replace(' ', 'T') + 'Z');
+    if (!Number.isNaN(ms)) return ms;
+  }
+
+  return Number.NaN;
 }
 
 function ensureOrganizationData() {
@@ -360,6 +380,30 @@ initDb();
 module.exports = {
   db,
 
+  activateDueScheduledTickets(serviceId = null) {
+    if (serviceId) {
+      db.prepare(`
+        UPDATE tickets
+        SET status = 'waiting',
+            refresh_wait_minutes = NULL
+        WHERE status = 'scheduled'
+          AND service_id = ?
+          AND planned_at IS NOT NULL
+          AND datetime(planned_at) <= datetime('now')
+      `).run(serviceId);
+      return;
+    }
+
+    db.prepare(`
+      UPDATE tickets
+      SET status = 'waiting',
+          refresh_wait_minutes = NULL
+      WHERE status = 'scheduled'
+        AND planned_at IS NOT NULL
+        AND datetime(planned_at) <= datetime('now')
+    `).run();
+  },
+
   upsertUser(telegramId, username, firstName, role = 'client') {
     const stmt = db.prepare(`
       INSERT INTO users (telegram_id, username, first_name, role)
@@ -456,7 +500,9 @@ module.exports = {
     return db.prepare('SELECT * FROM services WHERE id = ?').get(serviceId);
   },
 
-  createTicket(userId, serviceId) {
+  createTicket(userId, serviceId, plannedAt = null) {
+    this.activateDueScheduledTickets(serviceId);
+
     const activeTicket = this.getActiveTicket(userId);
     if (activeTicket) {
       throw new Error('Siz allaqachon navbatdasiz');
@@ -471,22 +517,35 @@ module.exports = {
     ).get(serviceId).count + 1;
 
     const ticketNumber = `${service.prefix}-${totalCount}`;
+    const plannedDate = plannedAt ? new Date(plannedAt) : null;
+    const isScheduled = !!(
+      plannedDate &&
+      !Number.isNaN(plannedDate.getTime()) &&
+      plannedDate.getTime() > Date.now()
+    );
 
-    const info = db.prepare(
-      'INSERT INTO tickets (user_id, service_id, ticket_number) VALUES (?, ?, ?)'
-    ).run(userId, serviceId, ticketNumber);
+    const info = isScheduled
+      ? db.prepare(
+        "INSERT INTO tickets (user_id, service_id, ticket_number, status, planned_at) VALUES (?, ?, ?, 'scheduled', ?)"
+      ).run(userId, serviceId, ticketNumber, plannedDate.toISOString())
+      : db.prepare(
+        'INSERT INTO tickets (user_id, service_id, ticket_number) VALUES (?, ?, ?)'
+      ).run(userId, serviceId, ticketNumber);
 
     const ticketId = Number(info.lastInsertRowid);
-    const peopleAhead = this.getPeopleAhead(ticketId, serviceId);
-    const initialWait = Math.max(1, peopleAhead + 1);
-
-    db.prepare('UPDATE tickets SET refresh_wait_minutes = ? WHERE id = ?')
-      .run(initialWait, ticketId);
+    if (!isScheduled) {
+      const peopleAhead = this.getPeopleAhead(ticketId, serviceId);
+      const initialWait = Math.max(1, peopleAhead + 1);
+      db.prepare('UPDATE tickets SET refresh_wait_minutes = ? WHERE id = ?')
+        .run(initialWait, ticketId);
+    }
 
     return db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
   },
 
   getActiveTicket(userId) {
+    this.activateDueScheduledTickets();
+
     return db.prepare(`
       SELECT
         t.*,
@@ -499,22 +558,50 @@ module.exports = {
       JOIN branches b ON s.branch_id = b.id
       LEFT JOIN organizations o ON o.id = b.organization_id
       LEFT JOIN institutions i ON i.id = b.institution_id
-      WHERE t.user_id = ? AND t.status IN ('waiting', 'called')
+      WHERE t.user_id = ? AND t.status IN ('scheduled', 'waiting', 'called')
     `).get(userId);
   },
 
   cancelTicket(ticketId, userId) {
     return db.prepare(
-      "UPDATE tickets SET status = 'cancelled' WHERE id = ? AND user_id = ? AND status = 'waiting'"
+      "UPDATE tickets SET status = 'cancelled' WHERE id = ? AND user_id = ? AND status IN ('scheduled', 'waiting')"
     ).run(ticketId, userId).changes > 0;
   },
 
   getWaitEstimate(ticketId, serviceId) {
     const ticket = db.prepare(
-      'SELECT status, service_id, refresh_wait_minutes FROM tickets WHERE id = ?'
+      'SELECT status, service_id, refresh_wait_minutes, planned_at FROM tickets WHERE id = ?'
     ).get(ticketId);
 
-    if (!ticket || ticket.status !== 'waiting') return 0;
+    if (!ticket) return 0;
+
+    if (ticket.status === 'scheduled') {
+      if (ticket.planned_at) {
+        const plannedMs = parsePlannedAtMs(ticket.planned_at);
+        if (!Number.isNaN(plannedMs)) {
+          const diff = Math.ceil((plannedMs - Date.now()) / 60000);
+          if (diff > 0) return diff;
+        }
+      }
+
+      const resolvedServiceId = serviceId || ticket.service_id;
+      this.activateDueScheduledTickets(resolvedServiceId);
+      const refreshed = db.prepare(
+        'SELECT status, service_id, refresh_wait_minutes FROM tickets WHERE id = ?'
+      ).get(ticketId);
+      if (!refreshed || refreshed.status !== 'waiting') return 0;
+      if (refreshed.refresh_wait_minutes !== null && refreshed.refresh_wait_minutes !== undefined) {
+        return Math.max(0, refreshed.refresh_wait_minutes);
+      }
+
+      const peopleAheadAfterActivation = this.getPeopleAhead(ticketId, refreshed.service_id);
+      const waitAfterActivation = Math.max(1, peopleAheadAfterActivation + 1);
+      db.prepare('UPDATE tickets SET refresh_wait_minutes = ? WHERE id = ?')
+        .run(waitAfterActivation, ticketId);
+      return waitAfterActivation;
+    }
+
+    if (ticket.status !== 'waiting') return 0;
     if (ticket.refresh_wait_minutes !== null && ticket.refresh_wait_minutes !== undefined) {
       return Math.max(0, ticket.refresh_wait_minutes);
     }
@@ -530,8 +617,23 @@ module.exports = {
   },
 
   decrementWaitOnRefresh(ticketId) {
-    const ticket = db.prepare('SELECT id, service_id, status FROM tickets WHERE id = ?').get(ticketId);
-    if (!ticket || ticket.status !== 'waiting') return 0;
+    const ticket = db.prepare('SELECT id, service_id, status, planned_at FROM tickets WHERE id = ?').get(ticketId);
+    if (!ticket) return 0;
+    if (ticket.status === 'scheduled') {
+      if (!ticket.planned_at) return 0;
+
+      const plannedMs = parsePlannedAtMs(ticket.planned_at);
+      if (Number.isNaN(plannedMs)) return 0;
+
+      // Demo rejim: har bir "yangilash" bosilganda rejalashtirilgan vaqtni 1 daqiqa yaqinlashtiramiz.
+      const nextPlanned = new Date(plannedMs - 60 * 1000).toISOString();
+      db.prepare('UPDATE tickets SET planned_at = ? WHERE id = ?')
+        .run(nextPlanned, ticket.id);
+
+      this.activateDueScheduledTickets(ticket.service_id);
+      return this.getWaitEstimate(ticket.id, ticket.service_id);
+    }
+    if (ticket.status !== 'waiting') return 0;
 
     const current = this.getWaitEstimate(ticket.id, ticket.service_id);
     const next = Math.max(0, current - 1);
@@ -543,23 +645,32 @@ module.exports = {
   },
 
   getVirtualPeopleAhead(ticketId, serviceId) {
+    const ticket = db.prepare('SELECT status FROM tickets WHERE id = ?').get(ticketId);
+    if (!ticket || ticket.status === 'scheduled') return 0;
+
     const wait = this.getWaitEstimate(ticketId, serviceId);
     return wait > 0 ? wait - 1 : 0;
   },
 
   getPeopleAhead(ticketId, serviceId) {
+    this.activateDueScheduledTickets(serviceId);
+
     return db.prepare(
       "SELECT COUNT(*) as count FROM tickets WHERE service_id = ? AND status = 'waiting' AND id < ?"
     ).get(serviceId, ticketId).count;
   },
 
   getQueueLength(serviceId) {
+    this.activateDueScheduledTickets(serviceId);
+
     return db.prepare(
       "SELECT COUNT(*) as count FROM tickets WHERE service_id = ? AND status = 'waiting'"
     ).get(serviceId).count;
   },
 
   getNextTicket(serviceId) {
+    this.activateDueScheduledTickets(serviceId);
+
     return db.prepare(`
       SELECT t.*, u.first_name, u.telegram_id 
       FROM tickets t
